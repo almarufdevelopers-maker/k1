@@ -99,7 +99,7 @@ def create_session():
     get_or_create_user(user_id)
 
     resp = requests.post(
-        f"{DIDIT_API_BASE}/v3/sessions/",
+        f"{DIDIT_API_BASE}/v3/session/",
         headers={"x-api-key": DIDIT_API_KEY},
         json={
             "workflow_id": DIDIT_WORKFLOW_ID,
@@ -121,8 +121,9 @@ def create_session():
 
     # Send this to the RN app. Never send DIDIT_API_KEY to the client.
     return jsonify({
-        "session_token": data.get("session_token") or data.get("token"),
-        "session_id": data.get("session_id") or data.get("id"),
+        "session_token": data.get("session_token"),
+        "session_id": data.get("session_id"),
+        "url": data.get("url"),  # hosted verification URL -- SDK opens this
     })
 
 

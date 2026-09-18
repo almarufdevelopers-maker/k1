@@ -30,6 +30,15 @@ import time
 import requests
 from flask import Flask, jsonify, request
 
+# Load variables from a local .env file (KEY=value, one per line) into the
+# environment. Only needed for local dev -- Render injects its own
+# Environment tab variables automatically, no dotenv needed there.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 app = Flask(__name__)
 
 # CORS is optional here -- only add flask_cors back if your RN app calls

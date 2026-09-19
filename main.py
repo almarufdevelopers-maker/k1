@@ -27,8 +27,6 @@ never hardcode them in this file):
   AT_USERNAME, AT_API_KEY            (Africa's Talking -- "sandbox" username
                                        while testing, your real username in
                                        production)
-  AT_SENDER_ID                       (optional -- approved Sender ID for
-                                       Kenya; leave unset to use the default)
   GOOGLE_CLIENT_ID
   SECRET_KEY                         (for JWT signing)
 """
@@ -84,9 +82,11 @@ try:
 
     # Always read from environment -- never hardcode credentials here.
     # Set these in Render's dashboard under your service's Environment tab.
-    AT_USERNAME = "sandbox"
-    AT_API_KEY = "atsk_ebcc23d72e5daf311e388cc8d92fb1419e56dc27ec51d80183c64b5db879970f8dc6fcf6"
-   
+    AT_USERNAME = os.environ.get("AT_USERNAME", "").strip()
+    AT_API_KEY = os.environ.get("AT_API_KEY", "").strip()
+    # No Sender ID registered yet -- Africa's Talking will use its default
+    # shared shortcode. Register one later (Business Console -> Sender IDs)
+    # once you're ready to brand your messages.
 
     if not AT_USERNAME or not AT_API_KEY:
         raise RuntimeError(
@@ -235,7 +235,7 @@ def _send_otp_sms(canonical: str, otp: str):
             f"Your Kiya verification code is {otp}. "
             f"Valid for {OTP_TTL_SECONDS // 60} minutes. Do not share it."
         )
-        response = sms.send(message, [canonical], sender_id=AT_SENDER_ID)
+        response = sms.send(message, [canonical])
         # Africa's Talking returns a dict; check for per-recipient failures.
         recipients = (response or {}).get("SMSMessageData", {}).get("Recipients", [])
         if recipients and recipients[0].get("status") != "Success":

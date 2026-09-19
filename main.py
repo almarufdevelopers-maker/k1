@@ -77,6 +77,13 @@ def utcnow():
 # ===========================================================================
 # Africa's Talking -- REQUIRED in production
 # ===========================================================================
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()   # <-- must run BEFORE any os.environ.get(...) call
+except ImportError:
+    print("WARNING: python-dotenv not installed; .env will not be loaded")
+    
 try:
     import africastalking
 

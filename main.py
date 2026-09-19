@@ -21,10 +21,14 @@ Other:
   GET  /users/<user_id>/verification-status -> Didit status poll
   GET  /uploads/images/<filename>          -> serve avatars
 
-Required env vars:
+Required env vars (set these in Render's dashboard -> Environment tab,
+never hardcode them in this file):
   DIDIT_API_KEY, DIDIT_WORKFLOW_ID, DIDIT_WEBHOOK_SECRET
-  AT_USERNAME, AT_API_KEY            (Africa's Talking, production)
-  AT_SENDER_ID                       (approved Sender ID for Kenya)
+  AT_USERNAME, AT_API_KEY            (Africa's Talking -- "sandbox" username
+                                       while testing, your real username in
+                                       production)
+  AT_SENDER_ID                       (optional -- approved Sender ID for
+                                       Kenya; leave unset to use the default)
   GOOGLE_CLIENT_ID
   SECRET_KEY                         (for JWT signing)
 """
@@ -78,14 +82,17 @@ def utcnow():
 try:
     import africastalking
 
-    AT_USERNAME = "sandbox"
-    AT_API_KEY = "atsk_ebcc23d72e5daf311e388cc8d92fb1419e56dc27ec51d80183c64b5db879970f8dc6fcf6"
- 
+    # Always read from environment -- never hardcode credentials here.
+    # Set these in Render's dashboard under your service's Environment tab.
+    AT_USERNAME = os.environ.get("AT_USERNAME", "").strip()
+    AT_API_KEY = os.environ.get("AT_API_KEY", "").strip()
+    AT_SENDER_ID = os.environ.get("AT_SENDER_ID", "").strip() or None
 
     if not AT_USERNAME or not AT_API_KEY:
         raise RuntimeError(
             "Africa's Talking credentials are required. "
-            "Set AT_USERNAME and AT_API_KEY in your environment."
+            "Set AT_USERNAME and AT_API_KEY in your environment "
+            "(Render dashboard -> Environment tab)."
         )
 
     africastalking.initialize(AT_USERNAME, AT_API_KEY)
@@ -372,7 +379,7 @@ def create_session():
         json={
             "workflow_id": DIDIT_WORKFLOW_ID,
             "vendor_data": user_id,
-            "callback": "https://k1-2-zz4n.onrender.com/verification/callback",
+            "callback": "https://k1-6.onrender.com/verification/callback",
         },
         timeout=15,
     )

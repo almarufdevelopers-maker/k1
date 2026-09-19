@@ -84,9 +84,9 @@ try:
 
     # Always read from environment -- never hardcode credentials here.
     # Set these in Render's dashboard under your service's Environment tab.
-    AT_USERNAME = os.environ.get("AT_USERNAME", "").strip()
-    AT_API_KEY = os.environ.get("AT_API_KEY", "").strip()
-    AT_SENDER_ID = os.environ.get("AT_SENDER_ID", "").strip() or None
+    AT_USERNAME = "sandbox"
+    AT_API_KEY = "atsk_ebcc23d72e5daf311e388cc8d92fb1419e56dc27ec51d80183c64b5db879970f8dc6fcf6"
+   
 
     if not AT_USERNAME or not AT_API_KEY:
         raise RuntimeError(

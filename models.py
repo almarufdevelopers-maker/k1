@@ -15,12 +15,12 @@ class UsersDetails(db.Model):
     user_fn = db.Column(db.String(120))
     user_ln = db.Column(db.String(120))
 
-    users_phone_number = db.Column(db.String(20), unique=True, nullable=False)
+    users_phone_number = db.Column(db.String(20), unique=True, nullable=True)
 
     country_code = db.Column(db.String(5))
     national_number = db.Column(db.String(20))
 
-    # Google identity (optional — set when the user signs in with Google)
+    # Google identity (optional)
     google_sub = db.Column(db.String(64), unique=True, nullable=True, index=True)
     email = db.Column(db.String(255), nullable=True, index=True)
 
@@ -96,7 +96,7 @@ class Landlords(db.Model):
     user_fn = db.Column(db.String(120))
     user_ln = db.Column(db.String(120))
 
-    landloards_phone_number = db.Column(db.String(20), unique=True, nullable=False)
+    landloards_phone_number = db.Column(db.String(20), unique=True, nullable=True)
 
     country_code = db.Column(db.String(5))
     national_number = db.Column(db.String(20))
@@ -116,6 +116,12 @@ class Landlords(db.Model):
     )
 
     user = db.relationship("UsersDetails", back_populates="landlord_profile")
+    listings = db.relationship(
+        "Listings",
+        backref="landlord",
+        cascade="all, delete-orphan",
+        lazy="select",
+    )
 
     def pretty_phone(self):
         try:
@@ -189,4 +195,78 @@ class OTPVerification(db.Model):
             "verified_at": self.verified_at.isoformat() if self.verified_at else None,
             "expires_at": self.expires_at.isoformat() if self.expires_at else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class Listings(db.Model):
+    __tablename__ = "listings"
+    id = db.Column(db.Integer, primary_key=True)
+
+    # Owner — landlord only
+    landlord_id = db.Column(
+        db.Integer,
+        db.ForeignKey("landlordsdetails.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    # Basic info
+    title = db.Column(db.String(150), nullable=False)
+    short_description = db.Column(db.String(255), nullable=False)
+    long_description = db.Column(db.Text, nullable=False)
+
+    # Location
+    location = db.Column(db.String(255), nullable=False, index=True)
+    county = db.Column(db.String(50), index=True)
+    latitude = db.Column(db.Float, nullable=True)
+    longitude = db.Column(db.Float, nullable=True)
+
+    # Pricing
+    price = db.Column(db.Numeric(10, 2), nullable=False)
+    deposit_amount = db.Column(db.Numeric(10, 2), nullable=False)
+    currency = db.Column(db.String(3), default="KES", nullable=False)
+
+    # Media — cover photo + at least 3 extra photos
+    cover_photo = db.Column(db.String(255), nullable=False)
+    photos = db.Column(db.JSON, default=list, nullable=False)
+
+    # Status
+    is_available = db.Column(db.Boolean, default=True, nullable=False, index=True)
+    is_published = db.Column(db.Boolean, default=False, nullable=False, index=True)
+
+    # Analytics
+    views_count = db.Column(db.Integer, default=0, nullable=False)
+
+    # Timestamps
+    created_at = db.Column(db.DateTime, default=utcnow, nullable=False)
+    updated_at = db.Column(
+        db.DateTime, default=utcnow, onupdate=utcnow, nullable=False,
+    )
+
+    __table_args__ = (
+        db.Index("ix_listings_county_price", "county", "price"),
+        db.Index("ix_listings_published_available", "is_published", "is_available"),
+    )
+
+    def to_json(self):
+        return {
+            "id": self.id,
+            "landlord_id": self.landlord_id,
+            "title": self.title,
+            "short_description": self.short_description,
+            "long_description": self.long_description,
+            "location": self.location,
+            "county": self.county,
+            "latitude": self.latitude,
+            "longitude": self.longitude,
+            "price": float(self.price) if self.price is not None else None,
+            "deposit_amount": float(self.deposit_amount) if self.deposit_amount is not None else None,
+            "currency": self.currency,
+            "cover_photo": self.cover_photo,
+            "photos": self.photos or [],
+            "is_available": self.is_available,
+            "is_published": self.is_published,
+            "views_count": self.views_count,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }

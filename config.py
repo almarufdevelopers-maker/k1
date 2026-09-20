@@ -28,7 +28,7 @@ mail = Mail(app)
 
 
 
-app.config['SQLALCHEMY_DATABASE_URI'] ='postgresql://root:xrrqK9InHHIyIA9WMD1KRX18oJIWU8LS@dpg-dan3t92jnfac73f96fk0-a.singapore-postgres.render.com:5432/backenddb_duhd'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://root:e6qmt4lXK7oaTxuHs0FDlFe9pVYbhyo3@dpg-danf18mgekts738ovqg0-a.singapore-postgres.render.com/backenddb_eng7'
 app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
     "connect_args": {
        "sslmode": "require"

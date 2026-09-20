@@ -1,34 +1,46 @@
 """
-Kiya backend -- Flask + Didit KYC + SMS OTP + Google Sign-In.
+Kiya backend -- Flask + Didit KYC + SMS OTP + Google Sign-In + Listings.
 
 Flow:
-  1. POST /create_user        -> creates PENDING user + sends OTP
-  2. POST /verify_otp         -> activates user (or wipes pending on failure)
-  3. POST /resend_otp         -> resend OTP for a pending user
-  4. POST /become_landlord    -> upgrade a verified user to landlord
-  5. POST /create_landlord    -> standalone landlord (own OTP flow)
-  6. POST /login_user         -> request OTP for a verified user
-  7. POST /verify_login_otp   -> verify OTP, return JWT
-  8. POST /google_signin      -> verify Google ID token; login OR request phone
-  9. POST /google_create_user -> create pending user with google_sub + OTP
- 10. GET  /me                 -> current user (Bearer JWT)
+  * Users sign up with first + last name only (phone optional).
+  * Login by first + last name returns a JWT.
+  * Landlords create listings. Everyone else can browse them.
+
+Endpoints:
+  1.  POST /create_user           -> creates user (name only, phone optional)
+  2.  POST /login_user            -> login by first + last name
+  3.  POST /update_phone          -> add phone later (optional)
+  4.  POST /request_verification  -> send OTP to verify a phone
+  5.  POST /verify_otp            -> verify OTP -> is_verified = True
+  6.  POST /resend_otp            -> resend OTP
+  7.  POST /create_landlord       -> standalone landlord (name only)
+  8.  POST /become_landlord       -> upgrade a user to landlord
+  9.  POST /verify_login_otp      -> login via OTP (kept for later)
+  10. POST /google_signin         -> verify Google ID token
+  11. POST /google_create_user    -> create user via Google
+  12. GET  /me                    -> current user
+  13. GET  /profile               -> view own profile
+  14. PUT  /profile               -> edit ONLY the profile photo
+  15. GET  /users/<id>            -> public profile
+  16. GET  /get_users             -> list users
+  17. GET  /get_landlords         -> list landlords
+
+Listings (landlord-only write, any-auth read):
+  18. POST   /listings                    -> create (landlord only)
+  19. GET    /listings                    -> browse (any logged-in user)
+  20. GET    /listings/mine               -> list my listings (landlord only)
+  21. GET    /listings/<id>               -> view one (any logged-in user)
+  22. PUT    /listings/<id>               -> update (owner only)
+  23. DELETE /listings/<id>               -> delete (owner only)
+  24. POST   /listings/<id>/publish       -> toggle published (owner only)
 
 Other:
   GET  /                                   -> health
   GET  /health                             -> health
   POST /create-session                     -> Didit KYC session
   POST /webhooks/didit                     -> Didit webhook receiver
-  GET  /users/<user_id>/verification-status -> Didit status poll
   GET  /uploads/images/<filename>          -> serve avatars
-
-Required env vars (set these in Render's dashboard -> Environment tab,
-never hardcode them in this file):
-  DIDIT_API_KEY, DIDIT_WORKFLOW_ID, DIDIT_WEBHOOK_SECRET
-  AT_USERNAME, AT_API_KEY            (Africa's Talking -- "sandbox" username
-                                       while testing, your real username in
-                                       production)
-  GOOGLE_CLIENT_ID
-  SECRET_KEY                         (for JWT signing)
+  GET  /uploads/listings/<filename>        -> serve listing photos
 """
 
 import hashlib
@@ -55,9 +67,16 @@ from config import (
     ALLOWED_PDF, ALLOWED_VIDEO, ALLOWED_IMAGE,
 )
 
-from models import UsersDetails, Landlords, OTPVerification
+from models import UsersDetails, Landlords, OTPVerification, Listings
 
-# --- Google sign-in -----------------------------------------------------------
+# --- Load .env ---------------------------------------------------------------
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    print("WARNING: python-dotenv not installed; .env will not be loaded")
+
+# --- Google sign-in ----------------------------------------------------------
 try:
     from google.oauth2 import id_token as google_id_token
     from google.auth.transport import requests as google_requests
@@ -70,89 +89,56 @@ except ImportError:
 
 
 def utcnow():
-    """UTC now, tz-naive. Safe for SQLite AND Postgres DateTime columns."""
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 # ===========================================================================
-# Africa's Talking -- REQUIRED in production
+# Africa's Talking (kept for later)
 # ===========================================================================
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv()   # <-- must run BEFORE any os.environ.get(...) call
-except ImportError:
-    print("WARNING: python-dotenv not installed; .env will not be loaded")
-    
 try:
     import africastalking
-
-    # Always read from environment -- never hardcode credentials here.
-    # Set these in Render's dashboard under your service's Environment tab.
     AT_USERNAME = os.environ.get("AT_USERNAME", "").strip()
     AT_API_KEY = os.environ.get("AT_API_KEY", "").strip()
-    # No Sender ID registered yet -- Africa's Talking will use its default
-    # shared shortcode. Register one later (Business Console -> Sender IDs)
-    # once you're ready to brand your messages.
+    AT_SENDER_ID = os.environ.get("AT_SENDER_ID", "").strip() or None
 
-    if not AT_USERNAME or not AT_API_KEY:
-        raise RuntimeError(
-            "Africa's Talking credentials are required. "
-            "Set AT_USERNAME and AT_API_KEY in your environment "
-            "(Render dashboard -> Environment tab)."
-        )
-
-    africastalking.initialize(AT_USERNAME, AT_API_KEY)
-    sms = africastalking.SMS
-    print(f"Africa's Talking initialized (username={AT_USERNAME})")
-
+    if AT_USERNAME and AT_API_KEY:
+        africastalking.initialize(AT_USERNAME, AT_API_KEY)
+        sms = africastalking.SMS
+        print(f"Africa's Talking initialized (username={AT_USERNAME}, sender_id={AT_SENDER_ID})")
+    else:
+        sms = None
+        print("WARNING: Africa's Talking not configured -- OTP SMS disabled.")
 except ImportError:
     sms = None
-    raise RuntimeError(
-        "africastalking SDK is required. Install with: pip install africastalking"
-    )
+    print("WARNING: africastalking SDK missing -- OTP SMS disabled.")
 
-
-# --- Backblaze B2 (optional) --------------------------------------------------
+# --- Backblaze B2 ------------------------------------------------------------
 B2_KEY_ID = os.getenv("B2_KEY_ID")
 B2_APP_KEY = os.getenv("B2_APP_KEY")
 B2_BUCKET_NAME = os.getenv("B2_BUCKET_NAME")
 
-# --- Didit config -------------------------------------------------------------
+# --- Didit -------------------------------------------------------------------
 DIDIT_API_KEY = os.environ.get("DIDIT_API_KEY", "")
 DIDIT_WORKFLOW_ID = os.environ.get("DIDIT_WORKFLOW_ID", "")
 DIDIT_WEBHOOK_SECRET = os.environ.get("DIDIT_WEBHOOK_SECRET", "")
 DIDIT_API_BASE = "https://verification.didit.me"
 WEBHOOK_MAX_SKEW_SECONDS = 300
 
-if not DIDIT_API_KEY:
-    raise RuntimeError("DIDIT_API_KEY is required.")
-if not DIDIT_WORKFLOW_ID:
-    raise RuntimeError("DIDIT_WORKFLOW_ID is required.")
-if not DIDIT_WEBHOOK_SECRET:
-    raise RuntimeError("DIDIT_WEBHOOK_SECRET is required.")
-
-# --- Google config ------------------------------------------------------------
+# --- Google ------------------------------------------------------------------
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
-if not GOOGLE_CLIENT_ID:
-    raise RuntimeError("GOOGLE_CLIENT_ID is required.")
-if not GOOGLE_LIB_OK:
-    raise RuntimeError("google-auth library is required.")
 
-# --- Phone config -------------------------------------------------------------
+# --- Phone config ------------------------------------------------------------
 DEFAULT_REGION = "KE"
 ALLOWED_REGIONS = {"KE", "UG", "TZ", "ET", "SO"}
 
-# --- OTP config ---------------------------------------------------------------
+# --- OTP config --------------------------------------------------------------
 OTP_TTL_SECONDS = 300
 OTP_MAX_ATTEMPTS = 5
 OTP_LENGTH = 6
 OTP_RESEND_COOLDOWN = 60
 
-# --- In-memory webhook dedupe (single-process only; use Redis for multi-worker)
 processed_event_ids: set[str] = set()
 
-# --- Avatar palette -----------------------------------------------------------
 AVATAR_COLORS = [
     "#F87171", "#FB923C", "#FBBF24", "#A3E635", "#34D399",
     "#22D3EE", "#60A5FA", "#A78BFA", "#F472B6", "#F43F5E",
@@ -219,41 +205,24 @@ def _generate_otp() -> str:
     return "".join(secrets.choice("0123456789") for _ in range(OTP_LENGTH))
 
 
-def _cleanup_expired_otps():
-    cutoff = utcnow() - timedelta(hours=24)
-    try:
-        OTPVerification.query.filter(
-            OTPVerification.created_at < cutoff
-        ).delete(synchronize_session=False)
-        db.session.commit()
-    except Exception as e:
-        db.session.rollback()
-        print(f"OTP cleanup failed: {e}")
-
-
 def _send_otp_sms(canonical: str, otp: str):
-    """
-    Send OTP via Africa's Talking.
-    Returns (ok: bool, error_message or None).
-    No local fallback: if SMS fails, we fail the request.
-    """
+    if sms is None:
+        return False, "SMS service not configured"
     try:
         message = (
             f"Your Kiya verification code is {otp}. "
             f"Valid for {OTP_TTL_SECONDS // 60} minutes. Do not share it."
         )
-        response = sms.send(message, [canonical])
-        # Africa's Talking returns a dict; check for per-recipient failures.
+        kwargs = {"sender_id": AT_SENDER_ID} if AT_SENDER_ID else {}
+        response = sms.send(message, [canonical], **kwargs)
         recipients = (response or {}).get("SMSMessageData", {}).get("Recipients", [])
         if recipients and recipients[0].get("status") != "Success":
-            err = recipients[0].get("status", "Unknown SMS error")
-            print(f"SMS delivery failed for {canonical}: {err}")
-            return False, f"SMS delivery failed: {err}"
+            return False, recipients[0].get("status", "Unknown SMS error")
         print(f"SMS sent to {canonical}: {response}")
         return True, None
     except Exception as e:
         print(f"SMS send error for {canonical}: {e}")
-        return False, "Failed to send SMS. Try again shortly."
+        return False, "Failed to send SMS."
 
 
 def _store_otp(canonical: str, otp: str, user_id: int):
@@ -280,6 +249,7 @@ def _issue_jwt(user: UsersDetails) -> str:
         "phone": user.users_phone_number,
         "is_landlord": user.is_landlord,
         "is_tenant": user.is_tenant,
+        "is_verified": user.is_verified,
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(days=30)).timestamp()),
     }
@@ -301,8 +271,19 @@ def _current_user_from_token():
     return UsersDetails.query.get(int(user_id))
 
 
+def _current_landlord_from_token():
+    """
+    Return (user, landlord).
+    - user: UsersDetails or None if not authenticated
+    - landlord: Landlords or None if user has no landlord profile
+    """
+    user = _current_user_from_token()
+    if not user:
+        return None, None
+    return user, user.landlord_profile
+
+
 def _verify_google_token(token: str):
-    """Return the decoded Google ID token payload, or raise ValueError."""
     if not GOOGLE_LIB_OK:
         raise ValueError("Server missing google-auth library")
     if not GOOGLE_CLIENT_ID:
@@ -354,7 +335,76 @@ def _get_body():
 
 
 # ===========================================================================
-# Health routes
+# Listing photo helpers
+# ===========================================================================
+LISTING_PHOTO_DIR = os.path.join(UPLOAD_FOLDER, "listings")
+os.makedirs(LISTING_PHOTO_DIR, exist_ok=True)
+
+MIN_EXTRA_PHOTOS = 3
+MAX_EXTRA_PHOTOS = 20
+
+
+def _save_listing_photo(file_storage) -> str:
+    if not file_storage or not file_storage.filename:
+        return None
+    if not allowed_file(file_storage.filename, ALLOWED_IMAGE):
+        raise ValueError("Unsupported image type. Allowed: png, jpg, jpeg, webp")
+    ext = file_storage.filename.rsplit(".", 1)[1].lower()
+    unique_name = secure_filename(f"{uuid.uuid4().hex}.{ext}")
+    filepath = os.path.join(LISTING_PHOTO_DIR, unique_name)
+    file_storage.save(filepath)
+    return f"uploads/listings/{unique_name}"
+
+
+def _collect_listing_photos(field_names, min_count=MIN_EXTRA_PHOTOS):
+    paths = []
+
+    # Uploaded files
+    for name in field_names:
+        files = request.files.getlist(name)
+        for f in files:
+            if f and f.filename:
+                try:
+                    paths.append(_save_listing_photo(f))
+                except ValueError as e:
+                    return [], str(e)
+
+    # JSON array of URLs
+    if not paths:
+        body = request.get_json(silent=True) or {}
+        for name in field_names:
+            urls = body.get(name)
+            if isinstance(urls, list):
+                paths.extend([u for u in urls if isinstance(u, str) and u.strip()])
+                break
+
+    if len(paths) < min_count:
+        return [], f"At least {min_count} photos are required"
+
+    if len(paths) > MAX_EXTRA_PHOTOS:
+        return [], f"Too many photos (max {MAX_EXTRA_PHOTOS})"
+
+    return paths, None
+
+
+def _collect_single_photo(field_name):
+    f = request.files.get(field_name)
+    if f and f.filename:
+        try:
+            return _save_listing_photo(f), None
+        except ValueError as e:
+            return None, str(e)
+
+    body = request.get_json(silent=True) or request.form
+    val = body.get(field_name)
+    if val and isinstance(val, str) and val.strip():
+        return val.strip(), None
+
+    return None, None
+
+
+# ===========================================================================
+# Health
 # ===========================================================================
 @app.route("/")
 def home():
@@ -371,7 +421,7 @@ def health():
 
 
 # ===========================================================================
-# Didit KYC endpoints
+# Didit KYC
 # ===========================================================================
 @app.route("/create-session", methods=["POST"])
 def create_session():
@@ -441,20 +491,8 @@ def verify_signature_simple(timestamp, session_id, status, webhook_type, signatu
 
 
 def process_webhook_event(event: dict) -> None:
-    webhook_type = event.get("webhook_type")
-    session_id = event.get("session_id")
-    vendor_data = event.get("vendor_data")
-    status = event.get("status")
-    decision = event.get("decision")
-    print(f"Processing webhook: type={webhook_type} session={session_id} status={status}")
-
-    if webhook_type in ("status.updated", "data.updated"):
-        if not vendor_data:
-            print("No vendor_data on session event -- skipping")
-            return
-        print(f"  user={vendor_data} status={status} decision={decision}")
-    else:
-        print(f"  Unhandled webhook_type: {webhook_type}")
+    print(f"Webhook: {event.get('webhook_type')} session={event.get('session_id')} "
+          f"status={event.get('status')}")
 
 
 @app.route("/webhooks/didit", methods=["POST"])
@@ -514,48 +552,44 @@ def get_verification_status(user_id):
 
 
 # ===========================================================================
-# 1. CREATE USER (pending) + SEND OTP
+# 1. CREATE USER
 # ===========================================================================
 @app.route("/create_user", methods=["POST"])
 def create_user():
     body = _get_body()
 
-    users_fn = body.get("users_fn")
-    users_ln = body.get("user_ln") or body.get("users_ln")
-    country_iso2 = (body.get("country_iso2") or DEFAULT_REGION).upper()
-    phone_national = body.get("phone_national")
-    raw_phone = phone_national or body.get("users_phone_number")
+    users_fn = (body.get("users_fn") or "").strip()
+    users_ln = (body.get("user_ln") or body.get("users_ln") or "").strip()
 
-    if not users_fn or not users_ln or not raw_phone:
-        return jsonify({
-            "message": "users_fn, user_ln and users_phone_number "
-                       "(or country_iso2 + phone_national) are required"
-        }), 400
+    if not users_fn or not users_ln:
+        return jsonify({"message": "users_fn and user_ln are required"}), 400
 
-    try:
-        canonical = normalize_phone(raw_phone, default_region=country_iso2)
-    except ValueError as e:
-        return jsonify({"message": str(e)}), 400
+    if len(users_fn) > 120 or len(users_ln) > 120:
+        return jsonify({"message": "Name too long"}), 400
 
-    cc, nn = split_phone(canonical)
-
-    existing_verified = UsersDetails.query.filter_by(
-        users_phone_number=canonical, is_verified=True
+    existing = UsersDetails.query.filter(
+        db.func.lower(UsersDetails.user_fn) == users_fn.lower(),
+        db.func.lower(UsersDetails.user_ln) == users_ln.lower(),
     ).first()
-    if existing_verified:
+    if existing:
         return jsonify({
-            "message": "An account with this phone number already exists"
+            "message": "An account with this name already exists. Please log in."
         }), 409
 
-    if Landlords.query.filter_by(landloards_phone_number=canonical).first():
-        return jsonify({
-            "message": "This phone number is already registered as a landlord."
-        }), 409
+    country_iso2 = (body.get("country_iso2") or DEFAULT_REGION).upper()
+    raw_phone = body.get("phone_national") or body.get("users_phone_number")
+    canonical = None
+    cc = nn = None
 
-    UsersDetails.query.filter_by(
-        users_phone_number=canonical, is_verified=False
-    ).delete(synchronize_session=False)
-    db.session.commit()
+    if raw_phone:
+        try:
+            canonical = normalize_phone(raw_phone, default_region=country_iso2)
+            cc, nn = split_phone(canonical)
+        except ValueError as e:
+            return jsonify({"message": str(e)}), 400
+
+        if UsersDetails.query.filter_by(users_phone_number=canonical).first():
+            return jsonify({"message": "This phone number is already registered"}), 409
 
     try:
         profile_photou, had_photo = resolve_profile_photo(
@@ -581,334 +615,64 @@ def create_user():
     db.session.add(new_user)
     db.session.commit()
 
-    otp = _generate_otp()
-    _store_otp(canonical, otp, user_id=new_user.id)
+    access_token = _issue_jwt(new_user)
 
-    ok, err = _send_otp_sms(canonical, otp)
-    if not ok:
-        db.session.delete(new_user)
-        db.session.commit()
-        return jsonify({"message": err or "Failed to send SMS"}), 502
-
-    masked = canonical[:6] + "****" + canonical[-2:]
     return jsonify({
-        "message": f"Account created (pending). Verification code sent to {masked}.",
-        "user_id": new_user.id,
-        "phone_display": new_user.pretty_phone(),
-        "expires_in": OTP_TTL_SECONDS,
-        "resend_cooldown": OTP_RESEND_COOLDOWN,
+        "message": "Account created",
+        "access_token": access_token,
+        "token_type": "Bearer",
+        "expires_in_days": 30,
+        "user": new_user.to_json(),
         "is_verified": False,
+        "next_step": "add_phone_later",
     }), 201
 
 
 # ===========================================================================
-# 2. VERIFY OTP
-# ===========================================================================
-@app.route("/verify_otp", methods=["POST"])
-def verify_otp():
-    body = _get_body()
-    country_iso2 = (body.get("country_iso2") or DEFAULT_REGION).upper()
-    raw_phone = body.get("phone_national") or body.get("users_phone_number")
-    otp_entered = (body.get("otp_code") or "").strip()
-
-    if not raw_phone or not otp_entered:
-        return jsonify({"message": "Phone number and OTP are required"}), 400
-
-    try:
-        canonical = normalize_phone(raw_phone, default_region=country_iso2)
-    except ValueError as e:
-        return jsonify({"message": str(e)}), 400
-
-    pending_user = UsersDetails.query.filter_by(
-        users_phone_number=canonical, is_verified=False
-    ).first()
-
-    def _wipe_pending(user, reason_msg, status):
-        if user:
-            OTPVerification.query.filter_by(
-                phone_number=canonical
-            ).delete(synchronize_session=False)
-            db.session.delete(user)
-            db.session.commit()
-        return jsonify({"message": reason_msg}), status
-
-    if not pending_user:
-        verified = UsersDetails.query.filter_by(
-            users_phone_number=canonical, is_verified=True
-        ).first()
-        if verified:
-            return jsonify({
-                "message": "This phone number is already verified",
-                "user": verified.to_json(),
-            }), 200
-        return jsonify({
-            "message": "No pending account. Please call /create_user first."
-        }), 404
-
-    record = (
-        OTPVerification.query
-        .filter_by(phone_number=canonical, consumed=False)
-        .order_by(OTPVerification.created_at.desc())
-        .first()
-    )
-
-    if not record:
-        return _wipe_pending(
-            pending_user,
-            "No active code. Pending account removed. Please register again.",
-            400,
-        )
-
-    if record.expires_at <= utcnow():
-        return _wipe_pending(
-            pending_user,
-            "Code expired. Pending account removed. Please register again.",
-            400,
-        )
-
-    if record.attempts >= OTP_MAX_ATTEMPTS:
-        return _wipe_pending(
-            pending_user,
-            "Too many attempts. Pending account removed. Please register again.",
-            429,
-        )
-
-    if not hmac.compare_digest(record.otp_hash, _hash_otp(otp_entered)):
-        record.attempts += 1
-        db.session.commit()
-        remaining = OTP_MAX_ATTEMPTS - record.attempts
-        if remaining <= 0:
-            return _wipe_pending(
-                pending_user,
-                "Too many wrong attempts. Pending account removed. Please register again.",
-                429,
-            )
-        return jsonify({
-            "message": f"Invalid code. {remaining} attempt(s) remaining."
-        }), 401
-
-    record.consumed = True
-    record.verified_at = utcnow()
-    pending_user.is_verified = True
-    pending_user.verified_at = utcnow()
-    db.session.commit()
-
-    return jsonify({
-        "message": "Phone verified successfully. Account activated.",
-        "user": pending_user.to_json(),
-    }), 200
-
-
-# ===========================================================================
-# 3. RESEND OTP
-# ===========================================================================
-@app.route("/resend_otp", methods=["POST"])
-def resend_otp():
-    body = _get_body()
-    country_iso2 = (body.get("country_iso2") or DEFAULT_REGION).upper()
-    raw_phone = body.get("phone_national") or body.get("users_phone_number")
-
-    if not raw_phone:
-        return jsonify({"message": "Phone number is required"}), 400
-
-    try:
-        canonical = normalize_phone(raw_phone, default_region=country_iso2)
-    except ValueError as e:
-        return jsonify({"message": str(e)}), 400
-
-    user = UsersDetails.query.filter_by(
-        users_phone_number=canonical, is_verified=False
-    ).first()
-    if not user:
-        return jsonify({
-            "message": "No pending account. Please call /create_user first."
-        }), 404
-
-    recent = (
-        OTPVerification.query
-        .filter_by(phone_number=canonical, consumed=False)
-        .order_by(OTPVerification.created_at.desc())
-        .first()
-    )
-    if recent and (utcnow() - recent.created_at).total_seconds() < OTP_RESEND_COOLDOWN:
-        wait = OTP_RESEND_COOLDOWN - int(
-            (utcnow() - recent.created_at).total_seconds()
-        )
-        return jsonify({
-            "message": f"Please wait {wait}s before requesting another code"
-        }), 429
-
-    otp = _generate_otp()
-    _store_otp(canonical, otp, user_id=user.id)
-
-    ok, err = _send_otp_sms(canonical, otp)
-    if not ok:
-        return jsonify({"message": err or "Failed to send SMS"}), 502
-
-    masked = canonical[:6] + "****" + canonical[-2:]
-    return jsonify({
-        "message": f"New verification code sent to {masked}",
-        "expires_in": OTP_TTL_SECONDS,
-    }), 200
-
-
-# ===========================================================================
-# 4. BECOME LANDLORD
-# ===========================================================================
-@app.route("/become_landlord", methods=["POST"])
-def become_landlord():
-    body = _get_body()
-    country_iso2 = (body.get("country_iso2") or DEFAULT_REGION).upper()
-    raw_phone = body.get("phone_national") or body.get("users_phone_number")
-
-    if not raw_phone:
-        return jsonify({"message": "users_phone_number or phone_national is required"}), 400
-
-    try:
-        canonical = normalize_phone(raw_phone, default_region=country_iso2)
-    except ValueError as e:
-        return jsonify({"message": str(e)}), 400
-
-    user = UsersDetails.query.filter_by(
-        users_phone_number=canonical, is_verified=True
-    ).first()
-    if not user:
-        return jsonify({
-            "message": "No verified user with this phone number."
-        }), 404
-
-    if user.landlord_profile:
-        return jsonify({
-            "message": "This user is already a landlord",
-            "landlord": user.landlord_profile.to_json(),
-        }), 409
-
-    try:
-        profile_photol, had_photo = resolve_profile_photo(
-            ["profile_photol", "profile_photo"]
-        )
-    except ValueError as e:
-        return jsonify({"message": str(e)}), 400
-
-    cc, nn = split_phone(canonical)
-
-    landlord = Landlords(
-        user_id=user.id,
-        user_fn=body.get("user_fn") or user.user_fn,
-        user_ln=body.get("user_ln") or user.user_ln,
-        landloards_phone_number=canonical,
-        country_code=cc,
-        national_number=nn,
-        profile_photol=profile_photol or user.profile_photou,
-        avatar_color=(
-            None if (had_photo or user.profile_photou)
-            else (user.avatar_color or random_avatar_color())
-        ),
-        is_verified=True,
-        verified_at=utcnow(),
-    )
-    user.is_landlord = True
-
-    try:
-        db.session.add(landlord)
-        db.session.commit()
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"message": "an error occurred", "detail": str(e)}), 500
-
-    return jsonify({
-        "message": "user is now a landlord",
-        "user": user.to_json(),
-        "landlord": landlord.to_json(),
-    }), 201
-
-
-# ===========================================================================
-# 5. STANDALONE LANDLORD
-# ===========================================================================
-@app.route("/create_landlord", methods=["POST"])
-def create_landlord():
-    body = _get_body()
-    users_fn = body.get("users_fn")
-    users_ln = body.get("user_ln") or body.get("users_ln")
-    country_iso2 = (body.get("country_iso2") or DEFAULT_REGION).upper()
-    raw_phone = (
-        body.get("phone_national")
-        or body.get("users_phone_number")
-        or body.get("landloards_phone_number")
-    )
-
-    if not users_fn or not users_ln or not raw_phone:
-        return jsonify({
-            "message": "users_fn, user_ln and users_phone_number are required"
-        }), 400
-
-    try:
-        canonical = normalize_phone(raw_phone, default_region=country_iso2)
-    except ValueError as e:
-        return jsonify({"message": str(e)}), 400
-
-    cc, nn = split_phone(canonical)
-
-    if UsersDetails.query.filter_by(
-        users_phone_number=canonical, is_verified=True
-    ).first():
-        return jsonify({
-            "message": "This phone already has a user account. Use /become_landlord instead."
-        }), 409
-    if Landlords.query.filter_by(landloards_phone_number=canonical).first():
-        return jsonify({
-            "message": "A landlord with this phone number already exists"
-        }), 409
-
-    try:
-        profile_photol, had_photo = resolve_profile_photo(
-            ["profile_photol", "profile_photo"]
-        )
-    except ValueError as e:
-        return jsonify({"message": str(e)}), 400
-
-    avatar_color = None if had_photo else random_avatar_color()
-
-    landlord = Landlords(
-        user_id=None,
-        user_fn=users_fn,
-        user_ln=users_ln,
-        landloards_phone_number=canonical,
-        country_code=cc,
-        national_number=nn,
-        profile_photol=profile_photol,
-        avatar_color=avatar_color,
-        is_verified=False,
-    )
-
-    try:
-        db.session.add(landlord)
-        db.session.commit()
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"message": "an error occurred", "detail": str(e)}), 500
-
-    return jsonify({
-        "message": "successfully created a landlord account (verify OTP to activate)",
-        "landlord": landlord.to_json(),
-    }), 201
-
-
-# ===========================================================================
-# 6. Serve uploaded avatars
-# ===========================================================================
-@app.route("/uploads/images/<path:filename>")
-def serve_uploaded_image(filename):
-    return send_from_directory(IMAGE_UPLOAD_FOLDER, filename)
-
-
-# ===========================================================================
-# 7. LOGIN — Step 1: request OTP for an existing verified user
+# 2. LOGIN
 # ===========================================================================
 @app.route("/login_user", methods=["POST"])
 def login_user():
     body = _get_body()
+
+    users_fn = (body.get("users_fn") or "").strip()
+    users_ln = (body.get("user_ln") or body.get("users_ln") or "").strip()
+
+    if not users_fn or not users_ln:
+        return jsonify({"message": "users_fn and user_ln are required"}), 400
+
+    user = UsersDetails.query.filter(
+        db.func.lower(UsersDetails.user_fn) == users_fn.lower(),
+        db.func.lower(UsersDetails.user_ln) == users_ln.lower(),
+    ).first()
+
+    if not user:
+        return jsonify({
+            "message": "No account with this name. Please sign up.",
+            "action": "signup",
+        }), 404
+
+    access_token = _issue_jwt(user)
+
+    return jsonify({
+        "message": "Login successful",
+        "access_token": access_token,
+        "token_type": "Bearer",
+        "expires_in_days": 30,
+        "user": user.to_json(),
+    }), 200
+
+
+# ===========================================================================
+# 3. UPDATE PHONE
+# ===========================================================================
+@app.route("/update_phone", methods=["POST"])
+def update_phone():
+    user = _current_user_from_token()
+    if not user:
+        return jsonify({"message": "Unauthorized"}), 401
+
+    body = _get_body()
     country_iso2 = (body.get("country_iso2") or DEFAULT_REGION).upper()
     raw_phone = body.get("phone_national") or body.get("users_phone_number")
 
@@ -920,60 +684,34 @@ def login_user():
     except ValueError as e:
         return jsonify({"message": str(e)}), 400
 
-    user = UsersDetails.query.filter_by(
-        users_phone_number=canonical, is_verified=True
+    cc, nn = split_phone(canonical)
+
+    other = UsersDetails.query.filter(
+        UsersDetails.users_phone_number == canonical,
+        UsersDetails.id != user.id,
     ).first()
+    if other:
+        return jsonify({"message": "This phone number is already registered"}), 409
 
-    if not user:
-        landlord = Landlords.query.filter_by(
-            landloards_phone_number=canonical
-        ).first()
-        if landlord:
-            return jsonify({
-                "message": "This phone is registered as a landlord. "
-                           "Use the landlord login flow.",
-                "action": "landlord_login",
-            }), 409
+    if Landlords.query.filter_by(landloards_phone_number=canonical).first():
+        return jsonify({"message": "This phone is registered as a landlord"}), 409
 
-        return jsonify({
-            "message": "No account found with this phone number. Please sign up.",
-            "action": "signup",
-        }), 404
+    user.users_phone_number = canonical
+    user.country_code = cc
+    user.national_number = nn
+    user.is_verified = False
+    user.verified_at = None
+    db.session.commit()
 
-    recent = (
-        OTPVerification.query
-        .filter_by(phone_number=canonical, consumed=False)
-        .order_by(OTPVerification.created_at.desc())
-        .first()
-    )
-    if recent and (utcnow() - recent.created_at).total_seconds() < OTP_RESEND_COOLDOWN:
-        wait = OTP_RESEND_COOLDOWN - int(
-            (utcnow() - recent.created_at).total_seconds()
-        )
-        return jsonify({
-            "message": f"Please wait {wait}s before requesting another code"
-        }), 429
-
-    otp = _generate_otp()
-    _store_otp(canonical, otp, user_id=user.id)
-
-    ok, err = _send_otp_sms(canonical, otp)
-    if not ok:
-        return jsonify({"message": err or "Failed to send SMS"}), 502
-
-    masked = canonical[:6] + "****" + canonical[-2:]
     return jsonify({
-        "message": f"Login code sent to {masked}",
-        "user_id": user.id,
-        "phone_display": user.pretty_phone(),
-        "expires_in": OTP_TTL_SECONDS,
-        "resend_cooldown": OTP_RESEND_COOLDOWN,
-        "has_google": bool(user.google_sub),
+        "message": "Phone updated. Please verify it.",
+        "user": user.to_json(),
+        "next_step": "request_verification",
     }), 200
 
 
 # ===========================================================================
-# 8. LOGIN — Step 2: verify OTP, return JWT
+# 4. VERIFY LOGIN OTP
 # ===========================================================================
 @app.route("/verify_login_otp", methods=["POST"])
 def verify_login_otp():
@@ -990,13 +728,9 @@ def verify_login_otp():
     except ValueError as e:
         return jsonify({"message": str(e)}), 400
 
-    user = UsersDetails.query.filter_by(
-        users_phone_number=canonical, is_verified=True
-    ).first()
+    user = UsersDetails.query.filter_by(users_phone_number=canonical).first()
     if not user:
-        return jsonify({
-            "message": "No verified account with this phone number."
-        }), 404
+        return jsonify({"message": "No account with this phone number."}), 404
 
     record = (
         OTPVerification.query
@@ -1004,40 +738,30 @@ def verify_login_otp():
         .order_by(OTPVerification.created_at.desc())
         .first()
     )
-
     if not record:
-        return jsonify({
-            "message": "No active code. Please request a new one."
-        }), 400
-
+        return jsonify({"message": "No active code."}), 400
     if record.expires_at <= utcnow():
         record.consumed = True
         db.session.commit()
-        return jsonify({
-            "message": "Code expired. Please request a new one."
-        }), 400
-
+        return jsonify({"message": "Code expired."}), 400
     if record.attempts >= OTP_MAX_ATTEMPTS:
         record.consumed = True
         db.session.commit()
-        return jsonify({
-            "message": "Too many attempts. Please request a new code."
-        }), 429
-
+        return jsonify({"message": "Too many attempts."}), 429
     if not hmac.compare_digest(record.otp_hash, _hash_otp(otp_entered)):
         record.attempts += 1
         db.session.commit()
         remaining = OTP_MAX_ATTEMPTS - record.attempts
-        return jsonify({
-            "message": f"Invalid code. {remaining} attempt(s) remaining."
-        }), 401
+        return jsonify({"message": f"Invalid code. {remaining} attempt(s) remaining."}), 401
 
     record.consumed = True
     record.verified_at = utcnow()
+    if not user.is_verified:
+        user.is_verified = True
+        user.verified_at = utcnow()
     db.session.commit()
 
     access_token = _issue_jwt(user)
-
     return jsonify({
         "message": "Login successful",
         "access_token": access_token,
@@ -1048,7 +772,271 @@ def verify_login_otp():
 
 
 # ===========================================================================
-# 9. GOOGLE — Step 1: verify ID token; login or ask for phone
+# 5. REQUEST VERIFICATION
+# ===========================================================================
+@app.route("/request_verification", methods=["POST"])
+def request_verification():
+    body = _get_body()
+    country_iso2 = (body.get("country_iso2") or DEFAULT_REGION).upper()
+    raw_phone = body.get("phone_national") or body.get("users_phone_number")
+
+    if not raw_phone:
+        return jsonify({"message": "Phone number is required"}), 400
+
+    try:
+        canonical = normalize_phone(raw_phone, default_region=country_iso2)
+    except ValueError as e:
+        return jsonify({"message": str(e)}), 400
+
+    user = UsersDetails.query.filter_by(users_phone_number=canonical).first()
+    landlord = Landlords.query.filter_by(landloards_phone_number=canonical).first()
+
+    if not user and not landlord:
+        return jsonify({"message": "No account found with this phone number."}), 404
+
+    account = user or landlord
+    account_kind = "user" if user else "landlord"
+
+    if account.is_verified:
+        return jsonify({"message": "This account is already verified"}), 409
+
+    recent = (
+        OTPVerification.query
+        .filter_by(phone_number=canonical, consumed=False)
+        .order_by(OTPVerification.created_at.desc())
+        .first()
+    )
+    if recent and (utcnow() - recent.created_at).total_seconds() < OTP_RESEND_COOLDOWN:
+        wait = OTP_RESEND_COOLDOWN - int((utcnow() - recent.created_at).total_seconds())
+        return jsonify({"message": f"Please wait {wait}s before requesting again"}), 429
+
+    otp = _generate_otp()
+    _store_otp(canonical, otp, user_id=user.id if user else None)
+
+    ok, err = _send_otp_sms(canonical, otp)
+    if not ok:
+        return jsonify({"message": err or "Failed to send SMS"}), 502
+
+    masked = canonical[:6] + "****" + canonical[-2:]
+    return jsonify({
+        "message": f"Verification code sent to {masked}",
+        "account_type": account_kind,
+        "expires_in": OTP_TTL_SECONDS,
+    }), 200
+
+
+# ===========================================================================
+# 6. VERIFY OTP
+# ===========================================================================
+@app.route("/verify_otp", methods=["POST"])
+def verify_otp():
+    body = _get_body()
+    country_iso2 = (body.get("country_iso2") or DEFAULT_REGION).upper()
+    raw_phone = body.get("phone_national") or body.get("users_phone_number")
+    otp_entered = (body.get("otp_code") or "").strip()
+
+    if not raw_phone or not otp_entered:
+        return jsonify({"message": "Phone number and OTP are required"}), 400
+
+    try:
+        canonical = normalize_phone(raw_phone, default_region=country_iso2)
+    except ValueError as e:
+        return jsonify({"message": str(e)}), 400
+
+    record = (
+        OTPVerification.query
+        .filter_by(phone_number=canonical, consumed=False)
+        .order_by(OTPVerification.created_at.desc())
+        .first()
+    )
+    if not record:
+        return jsonify({"message": "No active code."}), 400
+    if record.expires_at <= utcnow():
+        record.consumed = True
+        db.session.commit()
+        return jsonify({"message": "Code expired."}), 400
+    if record.attempts >= OTP_MAX_ATTEMPTS:
+        record.consumed = True
+        db.session.commit()
+        return jsonify({"message": "Too many attempts."}), 429
+    if not hmac.compare_digest(record.otp_hash, _hash_otp(otp_entered)):
+        record.attempts += 1
+        db.session.commit()
+        return jsonify({"message": f"Invalid code. {OTP_MAX_ATTEMPTS - record.attempts} left."}), 401
+
+    record.consumed = True
+    record.verified_at = utcnow()
+
+    user = UsersDetails.query.filter_by(users_phone_number=canonical).first()
+    landlord = Landlords.query.filter_by(landloards_phone_number=canonical).first()
+
+    if user and not user.is_verified:
+        user.is_verified = True
+        user.verified_at = utcnow()
+    if landlord and not landlord.is_verified:
+        landlord.is_verified = True
+        landlord.verified_at = utcnow()
+    db.session.commit()
+
+    return jsonify({
+        "message": "Phone verified successfully.",
+        "user": user.to_json() if user else None,
+        "landlord": landlord.to_json() if landlord else None,
+    }), 200
+
+
+# ===========================================================================
+# 7. RESEND OTP
+# ===========================================================================
+@app.route("/resend_otp", methods=["POST"])
+def resend_otp():
+    body = _get_body()
+    country_iso2 = (body.get("country_iso2") or DEFAULT_REGION).upper()
+    raw_phone = body.get("phone_national") or body.get("users_phone_number")
+
+    if not raw_phone:
+        return jsonify({"message": "Phone number is required"}), 400
+
+    try:
+        canonical = normalize_phone(raw_phone, default_region=country_iso2)
+    except ValueError as e:
+        return jsonify({"message": str(e)}), 400
+
+    user = UsersDetails.query.filter_by(users_phone_number=canonical).first()
+    landlord = Landlords.query.filter_by(landloards_phone_number=canonical).first()
+    if not user and not landlord:
+        return jsonify({"message": "No account found."}), 404
+
+    recent = (
+        OTPVerification.query
+        .filter_by(phone_number=canonical, consumed=False)
+        .order_by(OTPVerification.created_at.desc())
+        .first()
+    )
+    if recent and (utcnow() - recent.created_at).total_seconds() < OTP_RESEND_COOLDOWN:
+        wait = OTP_RESEND_COOLDOWN - int((utcnow() - recent.created_at).total_seconds())
+        return jsonify({"message": f"Please wait {wait}s"}), 429
+
+    otp = _generate_otp()
+    _store_otp(canonical, otp, user_id=user.id if user else None)
+
+    ok, err = _send_otp_sms(canonical, otp)
+    if not ok:
+        return jsonify({"message": err or "Failed to send SMS"}), 502
+
+    masked = canonical[:6] + "****" + canonical[-2:]
+    return jsonify({
+        "message": f"New code sent to {masked}",
+        "expires_in": OTP_TTL_SECONDS,
+    }), 200
+
+
+# ===========================================================================
+# 8. CREATE LANDLORD
+# ===========================================================================
+@app.route("/create_landlord", methods=["POST"])
+def create_landlord():
+    body = _get_body()
+
+    users_fn = (body.get("users_fn") or "").strip()
+    users_ln = (body.get("user_ln") or body.get("users_ln") or "").strip()
+
+    if not users_fn or not users_ln:
+        return jsonify({"message": "users_fn and user_ln are required"}), 400
+
+    try:
+        profile_photol, had_photo = resolve_profile_photo(
+            ["profile_photol", "profile_photo"]
+        )
+    except ValueError as e:
+        return jsonify({"message": str(e)}), 400
+
+    avatar_color = None if had_photo else random_avatar_color()
+
+    landlord = Landlords(
+        user_id=None,
+        user_fn=users_fn,
+        user_ln=users_ln,
+        landloards_phone_number=None,
+        country_code=None,
+        national_number=None,
+        profile_photol=profile_photol,
+        avatar_color=avatar_color,
+        is_verified=False,
+    )
+    db.session.add(landlord)
+    db.session.commit()
+
+    return jsonify({
+        "message": "Landlord account created",
+        "landlord": landlord.to_json(),
+        "is_verified": False,
+    }), 201
+
+
+# ===========================================================================
+# 9. BECOME LANDLORD
+# ===========================================================================
+@app.route("/become_landlord", methods=["POST"])
+def become_landlord():
+    user = _current_user_from_token()
+    if not user:
+        return jsonify({"message": "Unauthorized"}), 401
+
+    if user.landlord_profile:
+        return jsonify({
+            "message": "This user is already a landlord",
+            "landlord": user.landlord_profile.to_json(),
+        }), 409
+
+    try:
+        profile_photol, had_photo = resolve_profile_photo(
+            ["profile_photol", "profile_photo"]
+        )
+    except ValueError as e:
+        return jsonify({"message": str(e)}), 400
+
+    landlord = Landlords(
+        user_id=user.id,
+        user_fn=user.user_fn,
+        user_ln=user.user_ln,
+        landloards_phone_number=user.users_phone_number,
+        country_code=user.country_code,
+        national_number=user.national_number,
+        profile_photol=profile_photol or user.profile_photou,
+        avatar_color=(
+            None if (had_photo or user.profile_photou)
+            else (user.avatar_color or random_avatar_color())
+        ),
+        is_verified=user.is_verified,
+        verified_at=user.verified_at,
+    )
+    user.is_landlord = True
+    db.session.add(landlord)
+    db.session.commit()
+
+    return jsonify({
+        "message": "user is now a landlord",
+        "user": user.to_json(),
+        "landlord": landlord.to_json(),
+    }), 201
+
+
+# ===========================================================================
+# 10. Serve uploaded avatars
+# ===========================================================================
+@app.route("/uploads/images/<path:filename>")
+def serve_uploaded_image(filename):
+    return send_from_directory(IMAGE_UPLOAD_FOLDER, filename)
+
+
+@app.route("/uploads/listings/<path:filename>")
+def serve_listing_photo(filename):
+    return send_from_directory(LISTING_PHOTO_DIR, filename)
+
+
+# ===========================================================================
+# 11. GOOGLE -- Step 1
 # ===========================================================================
 @app.route("/google_signin", methods=["POST"])
 def google_signin():
@@ -1066,18 +1054,7 @@ def google_signin():
     if not google_sub:
         return jsonify({"message": "Google token missing 'sub'"}), 400
 
-    email = info.get("email")
-    name = info.get("name", "")
-    given = info.get("given_name") or (name.split(" ")[0] if name else "")
-    family = info.get("family_name") or (
-        " ".join(name.split(" ")[1:]) if " " in name else ""
-    )
-    picture = info.get("picture")
-
-    existing = UsersDetails.query.filter_by(
-        google_sub=google_sub, is_verified=True
-    ).first()
-
+    existing = UsersDetails.query.filter_by(google_sub=google_sub).first()
     if existing:
         access_token = _issue_jwt(existing)
         return jsonify({
@@ -1089,32 +1066,33 @@ def google_signin():
             "next_step": None,
         }), 200
 
+    name = info.get("name", "")
+    given = info.get("given_name") or (name.split(" ")[0] if name else "")
+    family = info.get("family_name") or (" ".join(name.split(" ")[1:]) if " " in name else "")
+
     return jsonify({
         "message": "Google verified. Please provide your phone number.",
         "google": {
             "sub": google_sub,
-            "email": email,
+            "email": info.get("email"),
             "name": name,
             "given_name": given,
             "family_name": family,
-            "picture": picture,
+            "picture": info.get("picture"),
         },
         "next_step": "provide_phone",
     }), 200
 
 
 # ===========================================================================
-# 10. GOOGLE — Step 2: create PENDING user with google_sub + send OTP
+# 12. GOOGLE -- Step 2
 # ===========================================================================
 @app.route("/google_create_user", methods=["POST"])
 def google_create_user():
     body = _get_body()
     token = body.get("google_id_token") or body.get("id_token")
-    country_iso2 = (body.get("country_iso2") or DEFAULT_REGION).upper()
-    raw_phone = body.get("phone_national") or body.get("users_phone_number")
-
-    if not token or not raw_phone:
-        return jsonify({"message": "google_id_token and phone are required"}), 400
+    if not token:
+        return jsonify({"message": "google_id_token is required"}), 400
 
     try:
         info = _verify_google_token(token)
@@ -1125,50 +1103,26 @@ def google_create_user():
     if not google_sub:
         return jsonify({"message": "Google token missing 'sub'"}), 400
 
-    email = info.get("email")
+    if UsersDetails.query.filter_by(google_sub=google_sub).first():
+        return jsonify({"message": "This Google account is already registered"}), 409
+
     name = info.get("name", "")
-    users_fn = body.get("users_fn") or info.get("given_name") or (
-        name.split(" ")[0] if name else ""
-    )
-    users_ln = body.get("user_ln") or body.get("users_ln") or info.get("family_name") or (
-        " ".join(name.split(" ")[1:]) if " " in name else ""
-    )
+    users_fn = (body.get("users_fn") or info.get("given_name") or (name.split(" ")[0] if name else "")).strip()
+    users_ln = (body.get("user_ln") or body.get("users_ln") or info.get("family_name") or (" ".join(name.split(" ")[1:]) if " " in name else "")).strip()
 
     if not users_fn or not users_ln:
-        return jsonify({
-            "message": "Could not determine name. Please provide users_fn and user_ln."
-        }), 400
+        return jsonify({"message": "users_fn and user_ln are required"}), 400
 
-    try:
-        canonical = normalize_phone(raw_phone, default_region=country_iso2)
-    except ValueError as e:
-        return jsonify({"message": str(e)}), 400
+    country_iso2 = (body.get("country_iso2") or DEFAULT_REGION).upper()
+    raw_phone = body.get("phone_national") or body.get("users_phone_number")
+    canonical = cc = nn = None
 
-    cc, nn = split_phone(canonical)
-
-    if UsersDetails.query.filter_by(
-        users_phone_number=canonical, is_verified=True
-    ).first():
-        return jsonify({"message": "An account with this phone already exists"}), 409
-
-    if Landlords.query.filter_by(landloards_phone_number=canonical).first():
-        return jsonify({"message": "This phone is registered as a landlord"}), 409
-
-    linked = UsersDetails.query.filter_by(
-        google_sub=google_sub, is_verified=True
-    ).first()
-    if linked:
-        return jsonify({
-            "message": "This Google account is already linked to another user."
-        }), 409
-
-    UsersDetails.query.filter(
-        (UsersDetails.users_phone_number == canonical) & (UsersDetails.is_verified == False)
-    ).delete(synchronize_session=False)
-    UsersDetails.query.filter(
-        (UsersDetails.google_sub == google_sub) & (UsersDetails.is_verified == False)
-    ).delete(synchronize_session=False)
-    db.session.commit()
+    if raw_phone:
+        try:
+            canonical = normalize_phone(raw_phone, default_region=country_iso2)
+            cc, nn = split_phone(canonical)
+        except ValueError as e:
+            return jsonify({"message": str(e)}), 400
 
     try:
         profile_photou, had_photo = resolve_profile_photo(
@@ -1195,33 +1149,517 @@ def google_create_user():
         is_landlord=False,
         is_verified=False,
         google_sub=google_sub,
-        email=email,
+        email=info.get("email"),
     )
     db.session.add(new_user)
     db.session.commit()
 
-    otp = _generate_otp()
-    _store_otp(canonical, otp, user_id=new_user.id)
+    access_token = _issue_jwt(new_user)
 
-    ok, err = _send_otp_sms(canonical, otp)
-    if not ok:
-        db.session.delete(new_user)
-        db.session.commit()
-        return jsonify({"message": err or "Failed to send SMS"}), 502
-
-    masked = canonical[:6] + "****" + canonical[-2:]
     return jsonify({
-        "message": f"Pending account created. Verify code sent to {masked}.",
-        "user_id": new_user.id,
-        "phone_display": new_user.pretty_phone(),
-        "expires_in": OTP_TTL_SECONDS,
-        "resend_cooldown": OTP_RESEND_COOLDOWN,
-        "is_verified": False,
+        "message": "Account created via Google",
+        "access_token": access_token,
+        "token_type": "Bearer",
+        "expires_in_days": 30,
+        "user": new_user.to_json(),
     }), 201
 
 
 # ===========================================================================
-# 11. Current user (protected)
+# 13. GET PROFILE
+# ===========================================================================
+@app.route("/profile", methods=["GET"])
+def get_profile():
+    user = _current_user_from_token()
+    if not user:
+        return jsonify({"message": "Unauthorized"}), 401
+    return jsonify({"user": user.to_json()}), 200
+
+
+# ===========================================================================
+# 14. UPDATE PROFILE -- photo only
+# ===========================================================================
+@app.route("/profile", methods=["PUT", "POST"])
+def update_profile():
+    user = _current_user_from_token()
+    if not user:
+        return jsonify({"message": "Unauthorized"}), 401
+
+    locked_fields = {
+        "users_fn", "user_fn", "users_ln", "user_ln",
+        "users_phone_number", "phone_national",
+        "country_iso2", "country_code", "national_number",
+        "email", "google_sub",
+    }
+    body = _get_body()
+    attempted = [k for k in locked_fields if k in body]
+    if attempted:
+        return jsonify({
+            "message": "Only the profile photo can be changed.",
+            "locked_fields": attempted,
+        }), 403
+
+    remove_photo = str(body.get("remove_photo", "")).lower() in ("1", "true", "yes")
+    if remove_photo:
+        user.profile_photou = None
+        if not user.avatar_color:
+            user.avatar_color = random_avatar_color()
+    else:
+        try:
+            new_photo, had_photo = resolve_profile_photo(
+                ["profile_photou", "profile_photo"]
+            )
+        except ValueError as e:
+            return jsonify({"message": str(e)}), 400
+
+        if had_photo:
+            user.profile_photou = new_photo
+            user.avatar_color = None
+
+    db.session.commit()
+    return jsonify({
+        "message": "Profile photo updated",
+        "user": user.to_json(),
+    }), 200
+
+
+# ===========================================================================
+# 15. PUBLIC PROFILE
+# ===========================================================================
+@app.route("/users/<int:user_id>", methods=["GET"])
+def get_public_profile(user_id):
+    caller = _current_user_from_token()
+    if not caller:
+        return jsonify({"message": "Unauthorized"}), 401
+
+    user = UsersDetails.query.get(user_id)
+    if not user:
+        return jsonify({"message": "User not found"}), 404
+
+    return jsonify({
+        "id": user.id,
+        "user_fn": user.user_fn,
+        "user_ln": user.user_ln,
+        "initial": (user.user_fn or "?").strip()[:1].upper(),
+        "profile_photo": user.profile_photou,
+        "avatar_color": user.avatar_color,
+        "is_verified": user.is_verified,
+        "is_landlord": user.is_landlord,
+        "is_tenant": user.is_tenant,
+        "created_at": user.created_at.isoformat() if user.created_at else None,
+    }), 200
+
+
+# ===========================================================================
+# 16 & 17. Lists
+# ===========================================================================
+@app.route("/get_users", methods=["GET"])
+def get_users():
+    users = UsersDetails.query.all()
+    return jsonify({"count": len(users), "users": [u.to_json() for u in users]}), 200
+
+
+@app.route("/get_landlords", methods=["GET"])
+def get_landlords():
+    landlords = Landlords.query.all()
+    return jsonify({"count": len(landlords), "landlords": [l.to_json() for l in landlords]}), 200
+
+
+# ===========================================================================
+# LISTINGS -- Landlords write, everyone reads
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# CREATE LISTING (landlord only)
+# ---------------------------------------------------------------------------
+@app.route("/listings", methods=["POST"])
+def create_listing():
+    """
+    multipart/form-data OR application/json.
+
+    Required:
+      title, short_description, long_description,
+      location, price, deposit_amount,
+      cover_photo (file OR URL),
+      photos      (3+ files OR JSON array of URL strings)
+
+    Optional:
+      county, latitude, longitude, currency, is_published
+    """
+    user, landlord = _current_landlord_from_token()
+    if not user:
+        return jsonify({"message": "Unauthorized"}), 401
+    if not landlord:
+        return jsonify({
+            "message": "Only landlords can create listings. "
+                       "Call /become_landlord first."
+        }), 403
+
+    body = _get_body()
+
+    title = (body.get("title") or "").strip()
+    short_description = (body.get("short_description") or "").strip()
+    long_description = (body.get("long_description") or "").strip()
+    location = (body.get("location") or "").strip()
+    county = (body.get("county") or "").strip() or None
+    currency = (body.get("currency") or "KES").strip().upper()
+
+    if not title or not short_description or not long_description or not location:
+        return jsonify({
+            "message": "title, short_description, long_description and location are required"
+        }), 400
+    if len(title) > 150:
+        return jsonify({"message": "Title too long (max 150)"}), 400
+    if len(short_description) > 255:
+        return jsonify({"message": "short_description too long (max 255)"}), 400
+    if len(currency) != 3:
+        return jsonify({"message": "currency must be a 3-letter code"}), 400
+
+    try:
+        price = float(body.get("price"))
+        deposit_amount = float(body.get("deposit_amount"))
+    except (TypeError, ValueError):
+        return jsonify({"message": "price and deposit_amount must be numbers"}), 400
+    if price <= 0 or deposit_amount < 0:
+        return jsonify({
+            "message": "price must be positive and deposit_amount >= 0"
+        }), 400
+
+    latitude = body.get("latitude")
+    longitude = body.get("longitude")
+    try:
+        latitude = float(latitude) if latitude is not None else None
+        longitude = float(longitude) if longitude is not None else None
+    except (TypeError, ValueError):
+        return jsonify({"message": "latitude and longitude must be numbers"}), 400
+
+    cover_photo, err = _collect_single_photo("cover_photo")
+    if err:
+        return jsonify({"message": err}), 400
+    if not cover_photo:
+        return jsonify({"message": "cover_photo is required"}), 400
+
+    photos, err = _collect_listing_photos(
+        ["photos", "additional_photos"], min_count=MIN_EXTRA_PHOTOS
+    )
+    if err:
+        return jsonify({"message": err}), 400
+
+    is_published = str(body.get("is_published", "")).lower() in ("1", "true", "yes")
+
+    listing = Listings(
+        landlord_id=landlord.id,
+        title=title,
+        short_description=short_description,
+        long_description=long_description,
+        location=location,
+        county=county,
+        latitude=latitude,
+        longitude=longitude,
+        price=price,
+        deposit_amount=deposit_amount,
+        currency=currency,
+        cover_photo=cover_photo,
+        photos=photos,
+        is_available=True,
+        is_published=is_published,
+    )
+
+    try:
+        db.session.add(listing)
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"message": "an error occurred", "detail": str(e)}), 500
+
+    return jsonify({
+        "message": "Listing created",
+        "listing": listing.to_json(),
+    }), 201
+
+
+# ---------------------------------------------------------------------------
+# BROWSE LISTINGS (any logged-in user)
+# ---------------------------------------------------------------------------
+@app.route("/listings", methods=["GET"])
+def browse_listings():
+    """
+    Read-only. Any authenticated user can call this.
+
+    Query params (all optional):
+      ?county=Nairobi
+      ?min_price=10000&max_price=50000
+      ?search=kilimani
+      ?available=true|false|any
+      ?limit=20&offset=0
+    """
+    caller = _current_user_from_token()
+    if not caller:
+        return jsonify({"message": "Unauthorized"}), 401
+
+    query = Listings.query.filter_by(is_published=True)
+
+    available = request.args.get("available", "true").lower()
+    if available != "any":
+        query = query.filter_by(is_available=available == "true")
+
+    county = request.args.get("county")
+    if county:
+        query = query.filter(Listings.county.ilike(f"%{county}%"))
+
+    search = request.args.get("search")
+    if search:
+        like = f"%{search.strip()}%"
+        query = query.filter(
+            (Listings.title.ilike(like)) |
+            (Listings.location.ilike(like)) |
+            (Listings.short_description.ilike(like))
+        )
+
+    try:
+        min_price = request.args.get("min_price")
+        max_price = request.args.get("max_price")
+        if min_price is not None:
+            query = query.filter(Listings.price >= float(min_price))
+        if max_price is not None:
+            query = query.filter(Listings.price <= float(max_price))
+    except ValueError:
+        return jsonify({"message": "min_price / max_price must be numbers"}), 400
+
+    try:
+        limit = min(int(request.args.get("limit", 20)), 100)
+        offset = int(request.args.get("offset", 0))
+    except ValueError:
+        return jsonify({"message": "limit / offset must be integers"}), 400
+
+    total = query.count()
+    listings = (
+        query.order_by(Listings.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+        .all()
+    )
+
+    return jsonify({
+        "count": len(listings),
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "listings": [l.to_json() for l in listings],
+    }), 200
+
+
+# ---------------------------------------------------------------------------
+# MY LISTINGS (landlord only)
+# ---------------------------------------------------------------------------
+@app.route("/listings/mine", methods=["GET"])
+def my_listings():
+    user, landlord = _current_landlord_from_token()
+    if not user:
+        return jsonify({"message": "Unauthorized"}), 401
+    if not landlord:
+        return jsonify({"message": "You are not a landlord"}), 403
+
+    listings = (
+        Listings.query
+        .filter_by(landlord_id=landlord.id)
+        .order_by(Listings.created_at.desc())
+        .all()
+    )
+    return jsonify({
+        "count": len(listings),
+        "listings": [l.to_json() for l in listings],
+    }), 200
+
+
+# ---------------------------------------------------------------------------
+# GET ONE LISTING (any logged-in user)
+# ---------------------------------------------------------------------------
+@app.route("/listings/<int:listing_id>", methods=["GET"])
+def get_listing(listing_id):
+    caller = _current_user_from_token()
+    if not caller:
+        return jsonify({"message": "Unauthorized"}), 401
+
+    listing = Listings.query.get(listing_id)
+    if not listing:
+        return jsonify({"message": "Listing not found"}), 404
+
+    try:
+        listing.views_count = (listing.views_count or 0) + 1
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+
+    return jsonify({"listing": listing.to_json()}), 200
+
+
+# ---------------------------------------------------------------------------
+# UPDATE LISTING (owner only)
+# ---------------------------------------------------------------------------
+@app.route("/listings/<int:listing_id>", methods=["PUT", "POST"])
+def update_listing(listing_id):
+    user, landlord = _current_landlord_from_token()
+    if not user:
+        return jsonify({"message": "Unauthorized"}), 401
+    if not landlord:
+        return jsonify({"message": "You are not a landlord"}), 403
+
+    listing = Listings.query.get(listing_id)
+    if not listing:
+        return jsonify({"message": "Listing not found"}), 404
+    if listing.landlord_id != landlord.id:
+        return jsonify({"message": "You do not own this listing"}), 403
+
+    body = _get_body()
+
+    if "title" in body:
+        title = (body.get("title") or "").strip()
+        if not title or len(title) > 150:
+            return jsonify({"message": "Invalid title"}), 400
+        listing.title = title
+
+    if "short_description" in body:
+        sd = (body.get("short_description") or "").strip()
+        if not sd or len(sd) > 255:
+            return jsonify({"message": "Invalid short_description"}), 400
+        listing.short_description = sd
+
+    if "long_description" in body:
+        ld = (body.get("long_description") or "").strip()
+        if not ld:
+            return jsonify({"message": "Invalid long_description"}), 400
+        listing.long_description = ld
+
+    if "location" in body:
+        loc = (body.get("location") or "").strip()
+        if not loc:
+            return jsonify({"message": "Invalid location"}), 400
+        listing.location = loc
+
+    if "county" in body:
+        listing.county = (body.get("county") or "").strip() or None
+
+    if "latitude" in body:
+        try:
+            listing.latitude = float(body.get("latitude")) if body.get("latitude") is not None else None
+        except (TypeError, ValueError):
+            return jsonify({"message": "Invalid latitude"}), 400
+
+    if "longitude" in body:
+        try:
+            listing.longitude = float(body.get("longitude")) if body.get("longitude") is not None else None
+        except (TypeError, ValueError):
+            return jsonify({"message": "Invalid longitude"}), 400
+
+    if "price" in body:
+        try:
+            price = float(body.get("price"))
+            if price <= 0:
+                raise ValueError
+            listing.price = price
+        except (TypeError, ValueError):
+            return jsonify({"message": "Invalid price"}), 400
+
+    if "deposit_amount" in body:
+        try:
+            dep = float(body.get("deposit_amount"))
+            if dep < 0:
+                raise ValueError
+            listing.deposit_amount = dep
+        except (TypeError, ValueError):
+            return jsonify({"message": "Invalid deposit_amount"}), 400
+
+    if "is_available" in body:
+        listing.is_available = str(body.get("is_available", "")).lower() in ("1", "true", "yes")
+
+    if "is_published" in body:
+        listing.is_published = str(body.get("is_published", "")).lower() in ("1", "true", "yes")
+
+    # Cover photo — replace if a new one is sent
+    if request.files.get("cover_photo") or "cover_photo" in body:
+        new_cover, err = _collect_single_photo("cover_photo")
+        if err:
+            return jsonify({"message": err}), 400
+        if new_cover:
+            listing.cover_photo = new_cover
+
+    # Photos — replace the entire array if new files/URLs are sent
+    sent_photos = False
+    for fld in ("photos", "additional_photos"):
+        if request.files.getlist(fld) or fld in body:
+            sent_photos = True
+            break
+    if sent_photos:
+        new_photos, err = _collect_listing_photos(
+            ["photos", "additional_photos"], min_count=MIN_EXTRA_PHOTOS
+        )
+        if err:
+            return jsonify({"message": err}), 400
+        listing.photos = new_photos
+
+    try:
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"message": "an error occurred", "detail": str(e)}), 500
+
+    return jsonify({
+        "message": "Listing updated",
+        "listing": listing.to_json(),
+    }), 200
+
+
+# ---------------------------------------------------------------------------
+# DELETE LISTING (owner only)
+# ---------------------------------------------------------------------------
+@app.route("/listings/<int:listing_id>", methods=["DELETE"])
+def delete_listing(listing_id):
+    user, landlord = _current_landlord_from_token()
+    if not user:
+        return jsonify({"message": "Unauthorized"}), 401
+    if not landlord:
+        return jsonify({"message": "You are not a landlord"}), 403
+
+    listing = Listings.query.get(listing_id)
+    if not listing:
+        return jsonify({"message": "Listing not found"}), 404
+    if listing.landlord_id != landlord.id:
+        return jsonify({"message": "You do not own this listing"}), 403
+
+    try:
+        db.session.delete(listing)
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"message": "an error occurred", "detail": str(e)}), 500
+
+    return jsonify({"message": "Listing deleted"}), 200
+
+
+# ---------------------------------------------------------------------------
+# TOGGLE PUBLISH (owner only)
+# ---------------------------------------------------------------------------
+@app.route("/listings/<int:listing_id>/publish", methods=["POST"])
+def toggle_publish(listing_id):
+    user, landlord = _current_landlord_from_token()
+    if not user or not landlord:
+        return jsonify({"message": "Unauthorized"}), 401
+
+    listing = Listings.query.get(listing_id)
+    if not listing or listing.landlord_id != landlord.id:
+        return jsonify({"message": "Listing not found"}), 404
+
+    listing.is_published = not listing.is_published
+    db.session.commit()
+    return jsonify({
+        "message": "Published" if listing.is_published else "Unpublished",
+        "listing": listing.to_json(),
+    }), 200
+
+
+# ===========================================================================
+# 18. Current user
 # ===========================================================================
 @app.route("/me", methods=["GET"])
 def me():
@@ -1232,7 +1670,7 @@ def me():
 
 
 # ===========================================================================
-# Run (production uses gunicorn; this block is for local "just run it" only)
+# Run
 # ===========================================================================
 if __name__ == "__main__":
     with app.app_context():
